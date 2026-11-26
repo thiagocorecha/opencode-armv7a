@@ -1,0 +1,177 @@
+name: Build Termux ARM (.deb)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "build/**"
+      - "termux/**"
+      - ".github/workflows/build-termux-deb.yml"
+  workflow_dispatch:
+    inputs:
+      opencode_ref:
+        description: "Upstream anomalyco/opencode commit or tag"
+        required: false
+        default: "bc5ebf00a4c169ece10f276e6ce02eaf18c326e6"
+      publish_release:
+        description: "Publish .deb to GitHub Releases"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    env:
+      OPENCODE_REF: ${{ github.event.inputs.opencode_ref || 'bc5ebf00a4c169ece10f276e6ce02eaf18c326e6' }}
+      OPENCODE_DIR: /tmp/opencode
+
+    steps:
+      - name: Checkout opencode-armv7a
+        uses: actions/checkout@v4
+
+      - name: Setup Bun 1.4.2
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Setup Node.js 26 (for smoke test)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+
+      - name: Verify packaging tools
+        run: |
+          dpkg-deb --version
+          bun --version
+          node --version
+
+      - name: Clone upstream anomalyco/opencode
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/anomalyco/opencode "$OPENCODE_DIR"
+          cd "$OPENCODE_DIR"
+          git checkout "$OPENCODE_REF"
+
+      - name: Install upstream dependencies
+        run: |
+          cd "$OPENCODE_DIR"
+          # README notes web-only deps (@solidjs/start, ghostty-web) may fail without affecting the CLI build
+          bun install || echo "::warning::bun install exited non-zero (expected for optional web-only deps), continuing..."
+
+      - name: Build Termux ARM .deb package
+        run: |
+          chmod +x build/build-termux-deb.sh termux/opencode
+          OPENCODE_CLI="$OPENCODE_DIR/packages/cli" sh build/build-termux-deb.sh
+          ls -lh out/opencode_*.deb
+          dpkg-deb --info out/opencode_*.deb
+          dpkg-deb --contents out/opencode_*.deb
+
+      - name: Smoke-test headless bundle on Node 26
+        run: |
+          mkdir -p /tmp/opencode-smoke
+          dpkg-deb -x out/opencode_*.deb /tmp/opencode-smoke
+          BUNDLE="/tmp/opencode-smoke/data/data/com.termux/files/usr/lib/opencode/opencode.mjs"
+          export OPENCODE_DISABLE_FILEWATCHER=1
+          export OPENCODE_DISABLE_FFF=1
+          export OPENCODE_SERVER_PASSWORD="smoke-test-password"
+
+          node --disable-warning=ExperimentalWarning "$BUNDLE" --version || true
+
+          node --disable-warning=ExperimentalWarning "$BUNDLE" serve --port 14096 --hostname 127.0.0.1 >/tmp/opencode-smoke.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+
+          READY=0
+          for i in $(seq 1 30); do
+            if curl -sf -u "opencode:$OPENCODE_SERVER_PASSWORD" http://127.0.0.1:14096/api/info >/tmp/api-info.json; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+
+          cat /tmp/opencode-smoke.log || true
+          if [ "$READY" -eq 1 ]; then
+            echo "Smoke test PASSED! /api/info response:"
+            cat /tmp/api-info.json
+            echo ""
+          else
+            echo "::warning::Smoke test server did not answer /api/info within 30s"
+            exit 1
+          fi
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd out
+          sha256sum opencode_*.deb > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload .deb workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-termux-arm-deb
+          path: |
+            out/opencode_*.deb
+            out/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: ${{ github.event_name == 'push' || github.event.inputs.publish_release != 'false' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DEB_FILE=$(ls out/opencode_*.deb | head -n 1)
+          DEB_NAME=$(basename "$DEB_FILE")
+          VERSION=$(echo "$DEB_NAME" | sed -E 's/^opencode_([^-]+)-.*$/\1/')
+          TAG="v${VERSION}-termux-arm"
+
+          cat > /tmp/release-notes.md <<EOF
+          ## OpenCode ${VERSION} (Headless) para Termux 32-bit ARM (\`arm\` / \`armv7l\` / \`armeabi-v7a\`)
+
+          Build automatizado via GitHub Actions pronto para instalar no **Termux (Android / Android TV 32-bit)**.
+
+          ### Instalação rápida no Termux (1 comando)
+
+          \`\`\`sh
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/termux/install-termux.sh | sh
+          \`\`\`
+
+          ### Instalação manual no Termux
+
+          \`\`\`sh
+          pkg update && pkg install -y nodejs curl
+          curl -fLO https://github.com/${{ github.repository }}/releases/download/${TAG}/${DEB_NAME}
+          apt install -y ./${DEB_NAME}
+          \`\`\`
+
+          ### Como rodar no Android TV
+
+          \`\`\`sh
+          # Opcional: evita o Android TV suspender o Termux
+          termux-wake-lock
+
+          # Inicia o servidor acessível na rede local (Wi-Fi/cabo)
+          OPENCODE_SERVER_PASSWORD='sua-senha' opencode serve --hostname 0.0.0.0 --port 4096
+          \`\`\`
+
+          ### SHA256
+          \`\`\`
+          $(cat out/SHA256SUMS.txt)
+          \`\`\`
+          EOF
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --title "OpenCode ${VERSION} for Termux ARM (32-bit)" \
+              --notes-file /tmp/release-notes.md
+            gh release upload "$TAG" "$DEB_FILE" out/SHA256SUMS.txt --clobber
+          else
+            gh release create "$TAG" "$DEB_FILE" out/SHA256SUMS.txt \
+              --title "OpenCode ${VERSION} for Termux ARM (32-bit)" \
+              --notes-file /tmp/release-notes.md \
+              --latest
+          fi
